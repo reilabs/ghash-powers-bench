@@ -11,9 +11,11 @@ const DEFAULT_MIN_LOG: u32 = 16;
 const DEFAULT_MAX_LOG: u32 = 24;
 const DEFAULT_SAMPLES: usize = 1;
 const DEFAULT_SEED: u64 = 0x4748_4153_485f_2026;
+const DEFAULT_B127_WINDOW_BITS: usize = 15;
 const DEFAULT_GHASH128_WINDOW_BITS: usize = 15;
 const DEFAULT_GHASH2_WINDOW_BITS: usize = 13;
 const DEFAULT_B163_WINDOW_BITS: usize = 15;
+const DEFAULT_B191_WINDOW_BITS: usize = 12;
 const DEFAULT_SECT193_WINDOW_BITS: usize = 12;
 const MAX_WINDOW_BITS: usize = 20;
 const MAX_FIELD_LIMBS: usize = 4;
@@ -23,7 +25,11 @@ const GHASH2_DELTA_U_POWER: usize = 121;
 #[cfg(test)]
 const GHASH2_BITS: usize = 256;
 
+static B127_TERMS: [usize; 2] = [0, 1];
 static B163_TERMS: [usize; 4] = [0, 3, 6, 7];
+// Degree-191 irreducible trinomial from
+// https://www.jjj.de/mathdata/all-trinomial-irredpoly-short.txt
+static B191_TERMS: [usize; 2] = [0, 9];
 static SECT193_TERMS: [usize; 2] = [0, 15];
 
 static B163_FIELD: BinaryFieldSpec = BinaryFieldSpec {
@@ -33,6 +39,13 @@ static B163_FIELD: BinaryFieldSpec = BinaryFieldSpec {
     terms: &B163_TERMS,
 };
 
+static B127_FIELD: BinaryFieldSpec = BinaryFieldSpec {
+    name: "b127",
+    description: "GF(2^127) / (u^127 + u + 1)",
+    bits: 127,
+    terms: &B127_TERMS,
+};
+
 static SECT193_FIELD: BinaryFieldSpec = BinaryFieldSpec {
     name: "sect193",
     description: "GF(2^193) / (u^193 + u^15 + 1)",
@@ -40,23 +53,34 @@ static SECT193_FIELD: BinaryFieldSpec = BinaryFieldSpec {
     terms: &SECT193_TERMS,
 };
 
+static B191_FIELD: BinaryFieldSpec = BinaryFieldSpec {
+    name: "b191",
+    description: "GF(2^191) / (u^191 + u^9 + 1)",
+    bits: 191,
+    terms: &B191_TERMS,
+};
+
 fn main() {
     let config = Config::parse_or_exit();
 
     if config.multiply {
         match config.field {
+            FieldChoice::B127 => run_b127_multiply(config),
             FieldChoice::Ghash128 => run_ghash128_multiply(config),
             FieldChoice::Ghash2 => run_ghash2_multiply(config),
             FieldChoice::B163 => run_b163_multiply(config),
+            FieldChoice::B191 => run_b191_multiply(config),
             FieldChoice::Sect193 => run_sect193_multiply(config),
         }
         return;
     }
 
     match config.field {
+        FieldChoice::B127 => run_b127(config),
         FieldChoice::Ghash128 => run_ghash128(config),
         FieldChoice::Ghash2 => run_ghash2(config),
         FieldChoice::B163 => run_b163(config),
+        FieldChoice::B191 => run_b191(config),
         FieldChoice::Sect193 => run_binary_field(config, &SECT193_FIELD),
     }
 }
@@ -116,6 +140,57 @@ fn run_ghash128(config: Config) {
         let ns_per_elem = best.as_secs_f64() * 1_000_000_000.0 / batch as f64;
         println!(
             "{log:>8} {batch:>12} {best_ms:>14.3} {ns_per_elem:>14.3} 0x{:032x}",
+            checksum.0
+        );
+    }
+}
+
+fn run_b127(config: Config) {
+    let max_batch = 1usize << config.max_log;
+    println!("Binary-field random fixed-base powers benchmark");
+    println!("field: {}", B127_FIELD.description);
+    println!("base: u (coefficient encoding 0x2)");
+    println!("exponents: random values in [0, 2^{EXPONENT_BITS})");
+    let backend = b127_backend();
+    println!("multiplication backend: {}", backend.name);
+    let compute = select_b127_compute(backend);
+    println!(
+        "batch logs: {}..={}, samples: {}, window bits: {}, seed: 0x{:016x}",
+        config.min_log, config.max_log, config.samples, config.window_bits, config.seed
+    );
+    let table = FixedBaseTable::new(GhashElement::GENERATOR, config.window_bits, backend);
+    println!(
+        "precompute table: {} windows, {:.1} MiB",
+        table.window_count(),
+        table.table_bytes() as f64 / (1024.0 * 1024.0)
+    );
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let exponents = random_exponents(&mut rng, max_batch);
+    let mut outputs = vec![GhashElement::ZERO; max_batch];
+    println!();
+    println!(
+        "{:>8} {:>12} {:>14} {:>14} {:>14}",
+        "log2(n)", "n", "best_ms", "ns/elem", "checksum"
+    );
+    for log in config.min_log..=config.max_log {
+        let batch = 1usize << log;
+        let mut best = Duration::MAX;
+        let mut checksum = GhashElement::ZERO;
+        for _ in 0..config.samples {
+            let start = Instant::now();
+            compute(
+                black_box(&table),
+                black_box(&exponents[..batch]),
+                black_box(&mut outputs[..batch]),
+            );
+            best = best.min(start.elapsed());
+            checksum = fold_checksum(black_box(&outputs[..batch]));
+            black_box(checksum);
+        }
+        println!(
+            "{log:>8} {batch:>12} {:>14.3} {:>14.3} 0x{:032x}",
+            best.as_secs_f64() * 1e3,
+            best.as_secs_f64() * 1e9 / batch as f64,
             checksum.0
         );
     }
@@ -303,6 +378,60 @@ fn run_b163(config: Config) {
     }
 }
 
+fn run_b191(config: Config) {
+    let max_batch = 1usize << config.max_log;
+    println!("Binary-field random fixed-base powers benchmark");
+    println!("field: b191 ({})", B191_FIELD.description);
+    println!("base: u (coefficient encoding bit 1)");
+    println!("exponents: random values in [0, 2^{EXPONENT_BITS})");
+    let backend = b191_backend();
+    println!("multiplication backend: {}", backend.name);
+    let compute = select_b191_compute(backend);
+    println!(
+        "batch logs: {}..={}, samples: {}, window bits: {}, seed: 0x{:016x}",
+        config.min_log, config.max_log, config.samples, config.window_bits, config.seed
+    );
+    let table = B163FixedBaseTable::new(config.window_bits, backend);
+    println!(
+        "precompute table: {} windows, {:.1} MiB",
+        table.window_count(),
+        table.table_bytes() as f64 / (1024.0 * 1024.0)
+    );
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let exponents = random_binary_exponents(&mut rng, EXPONENT_BITS, max_batch);
+    let mut outputs = vec![B163Element::ZERO; max_batch];
+    println!();
+    println!(
+        "{:>8} {:>12} {:>14} {:>14} {:>14}",
+        "log2(n)", "n", "best_ms", "ns/elem", "checksum"
+    );
+    for log in config.min_log..=config.max_log {
+        let batch = 1usize << log;
+        let mut best = Duration::MAX;
+        let mut checksum = B163Element::ZERO;
+        for _ in 0..config.samples {
+            let start = Instant::now();
+            compute(
+                black_box(&table),
+                black_box(&exponents[..batch]),
+                black_box(&mut outputs[..batch]),
+            );
+            best = best.min(start.elapsed());
+            checksum = outputs[..batch]
+                .iter()
+                .copied()
+                .fold(B163Element::ZERO, B163Element::add);
+            black_box(checksum);
+        }
+        println!(
+            "{log:>8} {batch:>12} {:>14.3} {:>14.3} {}",
+            best.as_secs_f64() * 1e3,
+            best.as_secs_f64() * 1e9 / batch as f64,
+            format_binary_hex(checksum.into_binary(), B191_FIELD.bits)
+        );
+    }
+}
+
 fn run_ghash128_multiply(config: Config) {
     let max_batch = 1usize << config.max_log;
     let backend = detected_backend();
@@ -314,6 +443,19 @@ fn run_ghash128_multiply(config: Config) {
     let rhs = random_exponents(&mut rng, max_batch);
     let mut outputs = vec![GhashElement::ZERO; max_batch];
     run_ghash_mul_batches(config, backend, &lhs, &rhs, &mut outputs);
+}
+
+fn run_b127_multiply(config: Config) {
+    let max_batch = 1usize << config.max_log;
+    let backend = b127_backend();
+    println!("Full-field multiplication benchmark");
+    println!("field: b127 GF(2^127)");
+    println!("multiplication backend: {}", backend.name);
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let lhs = random_b127_elements(&mut rng, max_batch);
+    let rhs = random_b127_elements(&mut rng, max_batch);
+    let mut outputs = vec![GhashElement::ZERO; max_batch];
+    run_b127_mul_batches(config, backend, &lhs, &rhs, &mut outputs);
 }
 
 fn run_ghash2_multiply(config: Config) {
@@ -342,6 +484,19 @@ fn run_b163_multiply(config: Config) {
     run_b163_mul_batches(config, backend, &lhs, &rhs, &mut outputs);
 }
 
+fn run_b191_multiply(config: Config) {
+    let max_batch = 1usize << config.max_log;
+    let backend = b191_backend();
+    println!("Full-field multiplication benchmark");
+    println!("field: b191 GF(2^191)");
+    println!("multiplication backend: {}", backend.name);
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let lhs = random_b191_elements(&mut rng, max_batch);
+    let rhs = random_b191_elements(&mut rng, max_batch);
+    let mut outputs = vec![B163Element::ZERO; max_batch];
+    run_b191_mul_batches(config, backend, &lhs, &rhs, &mut outputs);
+}
+
 fn run_sect193_multiply(config: Config) {
     let max_batch = 1usize << config.max_log;
     let backend = BinaryMulBackend::detect(&SECT193_FIELD);
@@ -364,6 +519,13 @@ fn random_ghash2_elements(rng: &mut StdRng, len: usize) -> Vec<Ghash2Element> {
         .collect()
 }
 
+fn random_b127_elements(rng: &mut StdRng, len: usize) -> Vec<u128> {
+    random_exponents(rng, len)
+        .into_iter()
+        .map(|value| value & (u128::MAX >> 1))
+        .collect()
+}
+
 fn random_b163_elements(rng: &mut StdRng, len: usize) -> Vec<B163Element> {
     (0..len)
         .map(|_| B163Element {
@@ -371,6 +533,18 @@ fn random_b163_elements(rng: &mut StdRng, len: usize) -> Vec<B163Element> {
                 rng.next_u64(),
                 rng.next_u64(),
                 rng.next_u64() & ((1u64 << 35) - 1),
+            ],
+        })
+        .collect()
+}
+
+fn random_b191_elements(rng: &mut StdRng, len: usize) -> Vec<B163Element> {
+    (0..len)
+        .map(|_| B163Element {
+            limbs: [
+                rng.next_u64(),
+                rng.next_u64(),
+                rng.next_u64() & (u64::MAX >> 1),
             ],
         })
         .collect()
@@ -392,6 +566,40 @@ fn run_ghash_mul_batches(
     outputs: &mut [GhashElement],
 ) {
     let multiply = select_ghash_mul_batch();
+    print_mul_header();
+    for log in config.min_log..=config.max_log {
+        let n = 1usize << log;
+        let mut best = Duration::MAX;
+        let mut checksum = GhashElement::ZERO;
+        for _ in 0..config.samples {
+            let start = Instant::now();
+            multiply(
+                black_box(&lhs[..n]),
+                black_box(&rhs[..n]),
+                black_box(&mut outputs[..n]),
+                backend,
+            );
+            best = best.min(start.elapsed());
+            checksum = fold_checksum(black_box(&outputs[..n]));
+            black_box(checksum);
+        }
+        println!(
+            "{log:>8} {n:>12} {:>14.3} {:>14.3} 0x{:032x}",
+            best.as_secs_f64() * 1e3,
+            best.as_secs_f64() * 1e9 / n as f64,
+            checksum.0
+        );
+    }
+}
+
+fn run_b127_mul_batches(
+    config: Config,
+    backend: Backend,
+    lhs: &[u128],
+    rhs: &[u128],
+    outputs: &mut [GhashElement],
+) {
+    let multiply = select_b127_mul_batch();
     print_mul_header();
     for log in config.min_log..=config.max_log {
         let n = 1usize << log;
@@ -485,6 +693,43 @@ fn run_b163_mul_batches(
             best.as_secs_f64() * 1e3,
             best.as_secs_f64() * 1e9 / n as f64,
             format_binary_hex(checksum.into_binary(), B163_FIELD.bits)
+        );
+    }
+}
+
+fn run_b191_mul_batches(
+    config: Config,
+    backend: B163MulBackend,
+    lhs: &[B163Element],
+    rhs: &[B163Element],
+    outputs: &mut [B163Element],
+) {
+    let multiply = select_b191_mul_batch();
+    print_mul_header();
+    for log in config.min_log..=config.max_log {
+        let n = 1usize << log;
+        let mut best = Duration::MAX;
+        let mut checksum = B163Element::ZERO;
+        for _ in 0..config.samples {
+            let start = Instant::now();
+            multiply(
+                black_box(&lhs[..n]),
+                black_box(&rhs[..n]),
+                black_box(&mut outputs[..n]),
+                backend,
+            );
+            best = best.min(start.elapsed());
+            checksum = outputs[..n]
+                .iter()
+                .copied()
+                .fold(B163Element::ZERO, B163Element::add);
+            black_box(checksum);
+        }
+        println!(
+            "{log:>8} {n:>12} {:>14.3} {:>14.3} {}",
+            best.as_secs_f64() * 1e3,
+            best.as_secs_f64() * 1e9 / n as f64,
+            format_binary_hex(checksum.into_binary(), B191_FIELD.bits)
         );
     }
 }
@@ -608,6 +853,14 @@ fn select_ghash_mul_batch() -> GhashMulBatch {
     multiply_ghash_batch
 }
 
+fn select_b127_mul_batch() -> GhashMulBatch {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("aes") {
+        return multiply_b127_batch_pmull_checked;
+    }
+    multiply_ghash_batch
+}
+
 fn select_ghash2_mul_batch() -> Ghash2MulBatch {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("aes") {
@@ -620,6 +873,14 @@ fn select_b163_mul_batch() -> B163MulBatch {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("aes") {
         return multiply_b163_batch_pmull_checked;
+    }
+    multiply_b163_batch
+}
+
+fn select_b191_mul_batch() -> B163MulBatch {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("aes") {
+        return multiply_b191_batch_pmull_checked;
     }
     multiply_b163_batch
 }
@@ -687,6 +948,16 @@ fn multiply_ghash_batch_pmull_checked(
 }
 
 #[cfg(target_arch = "aarch64")]
+fn multiply_b127_batch_pmull_checked(
+    lhs: &[u128],
+    rhs: &[u128],
+    outputs: &mut [GhashElement],
+    _backend: Backend,
+) {
+    unsafe { multiply_b127_batch_pmull(lhs, rhs, outputs) }
+}
+
+#[cfg(target_arch = "aarch64")]
 fn multiply_ghash2_batch_pmull_checked(
     lhs: &[Ghash2Element],
     rhs: &[Ghash2Element],
@@ -707,6 +978,16 @@ fn multiply_b163_batch_pmull_checked(
 }
 
 #[cfg(target_arch = "aarch64")]
+fn multiply_b191_batch_pmull_checked(
+    lhs: &[B163Element],
+    rhs: &[B163Element],
+    outputs: &mut [B163Element],
+    _backend: B163MulBackend,
+) {
+    unsafe { multiply_b191_batch_pmull(lhs, rhs, outputs) }
+}
+
+#[cfg(target_arch = "aarch64")]
 fn multiply_sect193_batch_pmull_checked(
     lhs: &[BinaryElement],
     rhs: &[BinaryElement],
@@ -720,6 +1001,14 @@ fn select_ghash_compute(_backend: Backend) -> GhashCompute {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("aes") {
         return compute_random_powers_pmull_checked;
+    }
+    compute_random_powers
+}
+
+fn select_b127_compute(_backend: Backend) -> GhashCompute {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("aes") {
+        return compute_b127_random_powers_pmull_checked;
     }
     compute_random_powers
 }
@@ -754,6 +1043,14 @@ fn select_b163_compute(_backend: B163MulBackend) -> B163Compute {
     compute_b163_random_powers
 }
 
+fn select_b191_compute(_backend: B163MulBackend) -> B163Compute {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("aes") {
+        return compute_b191_random_powers_pmull_checked;
+    }
+    compute_b163_random_powers
+}
+
 #[cfg(target_arch = "aarch64")]
 fn compute_random_powers_pmull_checked(
     table: &FixedBaseTable,
@@ -762,6 +1059,15 @@ fn compute_random_powers_pmull_checked(
 ) {
     // SAFETY: selected only after runtime PMULL detection.
     unsafe { compute_random_powers_pmull(table, exponents, outputs) }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn compute_b127_random_powers_pmull_checked(
+    table: &FixedBaseTable,
+    exponents: &[u128],
+    outputs: &mut [GhashElement],
+) {
+    unsafe { compute_b127_random_powers_pmull(table, exponents, outputs) }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -782,6 +1088,15 @@ fn compute_b163_random_powers_pmull_checked(
 ) {
     // SAFETY: selected only after runtime PMULL detection.
     unsafe { compute_b163_random_powers_pmull(table, exponents, outputs) }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn compute_b191_random_powers_pmull_checked(
+    table: &B163FixedBaseTable,
+    exponents: &[BinaryElement],
+    outputs: &mut [B163Element],
+) {
+    unsafe { compute_b191_random_powers_pmull(table, exponents, outputs) }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -832,7 +1147,7 @@ impl Config {
                 eprintln!("{message}");
                 eprintln!();
                 eprintln!(
-                    "usage: cargo run --release --bin ghash-powers-bench -- [--field ghash128|ghash2|b163|sect193] [--mul] [--min-log N] [--max-log N] [--samples N] [--window-bits N] [--seed N]"
+                    "usage: cargo run --release --bin ghash-powers-bench -- [--field b127|ghash128|ghash2|b163|b191|sect193] [--mul] [--min-log N] [--max-log N] [--samples N] [--window-bits N] [--seed N]"
                 );
                 eprintln!(
                     "defaults: --field ghash128 --min-log 16 --max-log 24 --samples 1 --window-bits field-specific --seed 0x47484153485f2026"
@@ -932,29 +1247,35 @@ impl Config {
 
 #[derive(Clone, Copy)]
 enum FieldChoice {
+    B127,
     Ghash128,
     Ghash2,
     B163,
+    B191,
     Sect193,
 }
 
 fn default_window_bits(field: FieldChoice) -> usize {
     match field {
+        FieldChoice::B127 => DEFAULT_B127_WINDOW_BITS,
         FieldChoice::Ghash128 => DEFAULT_GHASH128_WINDOW_BITS,
         FieldChoice::Ghash2 => DEFAULT_GHASH2_WINDOW_BITS,
         FieldChoice::B163 => DEFAULT_B163_WINDOW_BITS,
+        FieldChoice::B191 => DEFAULT_B191_WINDOW_BITS,
         FieldChoice::Sect193 => DEFAULT_SECT193_WINDOW_BITS,
     }
 }
 
 fn parse_field(value: &str) -> Result<FieldChoice, String> {
     match value {
+        "b127" | "127" => Ok(FieldChoice::B127),
         "ghash128" | "ghash" | "128" => Ok(FieldChoice::Ghash128),
         "ghash2" | "ghash256" | "qghash" | "256" => Ok(FieldChoice::Ghash2),
         "b163" | "163" | "nist163" => Ok(FieldChoice::B163),
+        "b191" | "191" => Ok(FieldChoice::B191),
         "sect193" | "193" | "sec193" => Ok(FieldChoice::Sect193),
         _ => Err(format!(
-            "unknown field {value:?}; expected ghash128, ghash2, b163, or sect193"
+            "unknown field {value:?}; expected b127, ghash128, ghash2, b163, b191, or sect193"
         )),
     }
 }
@@ -1277,6 +1598,20 @@ impl B163MulBackend {
     }
 }
 
+fn b191_backend() -> B163MulBackend {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("aes") {
+        return B163MulBackend {
+            name: "aarch64-pmull-karatsuba",
+            mul: mul_b191_compact_pmull_checked,
+        };
+    }
+    B163MulBackend {
+        name: "portable",
+        mul: mul_b191_compact_portable,
+    }
+}
+
 struct B163FixedBaseTable {
     table: Vec<B163Element>,
     mul: B163Mul,
@@ -1348,6 +1683,14 @@ unsafe fn multiply_ghash_batch_pmull(lhs: &[u128], rhs: &[u128], outputs: &mut [
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
+unsafe fn multiply_b127_batch_pmull(lhs: &[u128], rhs: &[u128], outputs: &mut [GhashElement]) {
+    for ((lhs, rhs), output) in lhs.iter().zip(rhs).zip(outputs) {
+        *output = GhashElement(unsafe { mul_b127_pmull(*lhs, *rhs) });
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
 unsafe fn multiply_ghash2_batch_pmull(
     lhs: &[Ghash2Element],
     rhs: &[Ghash2Element],
@@ -1367,6 +1710,18 @@ unsafe fn multiply_b163_batch_pmull(
 ) {
     for ((lhs, rhs), output) in lhs.iter().zip(rhs).zip(outputs) {
         *output = unsafe { mul_b163_compact_pmull(*lhs, *rhs) };
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+unsafe fn multiply_b191_batch_pmull(
+    lhs: &[B163Element],
+    rhs: &[B163Element],
+    outputs: &mut [B163Element],
+) {
+    for ((lhs, rhs), output) in lhs.iter().zip(rhs).zip(outputs) {
+        *output = unsafe { mul_b191_compact_pmull(*lhs, *rhs) };
     }
 }
 
@@ -1398,6 +1753,29 @@ unsafe fn compute_random_powers_pmull(
             if value != 0 {
                 acc = GhashElement(unsafe {
                     mul_raw_pmull(acc.0, table.table[window * table.window_size + value].0)
+                });
+            }
+        }
+        *output = acc;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+unsafe fn compute_b127_random_powers_pmull(
+    table: &FixedBaseTable,
+    exponents: &[u128],
+    outputs: &mut [GhashElement],
+) {
+    assert_eq!(exponents.len(), outputs.len());
+    for (exponent, output) in exponents.iter().copied().zip(outputs) {
+        let mut acc = GhashElement::ONE;
+        for window in 0..table.window_count {
+            let shift = window * table.window_bits;
+            let value = ((exponent >> shift) & table.window_mask) as usize;
+            if value != 0 {
+                acc = GhashElement(unsafe {
+                    mul_b127_pmull(acc.0, table.table[window * table.window_size + value].0)
                 });
             }
         }
@@ -1457,6 +1835,29 @@ unsafe fn compute_b163_random_powers_pmull(
             if value != 0 {
                 acc = unsafe {
                     mul_b163_compact_pmull(acc, table.table[window * table.window_size + value])
+                };
+            }
+        }
+        *output = acc;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+unsafe fn compute_b191_random_powers_pmull(
+    table: &B163FixedBaseTable,
+    exponents: &[BinaryElement],
+    outputs: &mut [B163Element],
+) {
+    assert_eq!(exponents.len(), outputs.len());
+    for (exponent, output) in exponents.iter().copied().zip(outputs) {
+        let mut acc = B163Element::ONE;
+        for window in 0..table.window_count {
+            let shift = window * table.window_bits;
+            let value = exponent.window(shift, table.window_bits, table.window_mask);
+            if value != 0 {
+                acc = unsafe {
+                    mul_b191_compact_pmull(acc, table.table[window * table.window_size + value])
                 };
             }
         }
@@ -1587,6 +1988,11 @@ fn mul_b163_compact_pmull_checked(lhs: B163Element, rhs: B163Element) -> B163Ele
 }
 
 #[cfg(target_arch = "aarch64")]
+fn mul_b191_compact_pmull_checked(lhs: B163Element, rhs: B163Element) -> B163Element {
+    unsafe { mul_b191_compact_pmull(lhs, rhs) }
+}
+
+#[cfg(target_arch = "aarch64")]
 fn mul_sect193_pmull_checked(lhs: BinaryElement, rhs: BinaryElement) -> BinaryElement {
     // SAFETY: `BinaryMulBackend::detect` only selects this function after checking PMULL availability.
     unsafe { mul_sect193_pmull(lhs, rhs) }
@@ -1603,6 +2009,16 @@ unsafe fn mul_b163_pmull(lhs: BinaryElement, rhs: BinaryElement) -> BinaryElemen
 #[target_feature(enable = "aes")]
 unsafe fn mul_b163_compact_pmull(lhs: B163Element, rhs: B163Element) -> B163Element {
     B163Element::from_binary(reduce_b163_product(product_3limb_pmull(
+        lhs.into_binary(),
+        rhs.into_binary(),
+    )))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn mul_b191_compact_pmull(lhs: B163Element, rhs: B163Element) -> B163Element {
+    B163Element::from_binary(reduce_b191_product(product_3limb_pmull(
         lhs.into_binary(),
         rhs.into_binary(),
     )))
@@ -1675,6 +2091,15 @@ fn mul_b163_portable(lhs: BinaryElement, rhs: BinaryElement) -> BinaryElement {
 
 fn mul_b163_compact_portable(lhs: B163Element, rhs: B163Element) -> B163Element {
     B163Element::from_binary(mul_b163_portable(lhs.into_binary(), rhs.into_binary()))
+}
+
+fn mul_b191_compact_portable(lhs: B163Element, rhs: B163Element) -> B163Element {
+    B163Element::from_binary(mul_binary_generic(
+        lhs.into_binary(),
+        rhs.into_binary(),
+        &B191_FIELD,
+        clmul64_portable,
+    ))
 }
 
 fn mul_sect193_portable(lhs: BinaryElement, rhs: BinaryElement) -> BinaryElement {
@@ -1751,6 +2176,24 @@ fn reduce_b163_product(product: [u64; MAX_PRODUCT_LIMBS]) -> BinaryElement {
             t0 ^ carry ^ (carry << 3) ^ (carry << 6) ^ (carry << 7),
             t1,
             t2 & LOW_MASK,
+            0,
+        ],
+    }
+}
+
+fn reduce_b191_product(product: [u64; MAX_PRODUCT_LIMBS]) -> BinaryElement {
+    // u^191 = u^9 + 1. After the first fold, only the top eight bits of
+    // u^9 H can cross degree 190, so one small second fold completes it.
+    let h0 = (product[2] >> 63) | (product[3] << 1);
+    let h1 = (product[3] >> 63) | (product[4] << 1);
+    let h2 = (product[4] >> 63) | (product[5] << 1);
+    let carry = h2 >> 54;
+
+    BinaryElement {
+        limbs: [
+            product[0] ^ h0 ^ (h0 << 9) ^ carry ^ (carry << 9),
+            product[1] ^ h1 ^ (h0 >> 55) ^ (h1 << 9),
+            ((product[2] & (u64::MAX >> 1)) ^ h2 ^ (h1 >> 55) ^ (h2 << 9)) & (u64::MAX >> 1),
             0,
         ],
     }
@@ -1959,6 +2402,20 @@ fn detected_backend() -> Backend {
     *BACKEND.get_or_init(Backend::detect)
 }
 
+fn b127_backend() -> Backend {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("aes") {
+        return Backend {
+            name: "aarch64-pmull",
+            mul: mul_b127_pmull_checked,
+        };
+    }
+    Backend {
+        name: "portable",
+        mul: mul_b127_portable,
+    }
+}
+
 impl Backend {
     fn detect() -> Self {
         #[cfg(target_arch = "aarch64")]
@@ -1985,6 +2442,26 @@ fn mul_raw_pmull_checked(lhs: u128, rhs: u128) -> u128 {
         // SAFETY: `Backend::detect` only selects this function after checking PMULL availability.
         unsafe { mul_raw_pmull(lhs, rhs) }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn mul_b127_pmull_checked(lhs: u128, rhs: u128) -> u128 {
+    unsafe { mul_b127_pmull(lhs, rhs) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn mul_b127_pmull(lhs: u128, rhs: u128) -> u128 {
+    use std::arch::aarch64::vmull_p64;
+    let a0 = lhs as u64;
+    let a1 = (lhs >> 64) as u64;
+    let b0 = rhs as u64;
+    let b1 = (rhs >> 64) as u64;
+    let z0 = vmull_p64(a0, b0);
+    let z2 = vmull_p64(a1, b1);
+    let z1 = vmull_p64(a0 ^ a1, b0 ^ b1) ^ z0 ^ z2;
+    reduce_b127_product(z0 ^ (z1 << 64), z2 ^ (z1 >> 64))
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2026,6 +2503,25 @@ fn mul_raw_portable(lhs: u128, rhs: u128) -> u128 {
     }
 
     reduce_product(low, high)
+}
+
+fn mul_b127_portable(lhs: u128, rhs: u128) -> u128 {
+    let result = mul_binary_generic(
+        BinaryElement {
+            limbs: [lhs as u64, (lhs >> 64) as u64, 0, 0],
+        },
+        BinaryElement {
+            limbs: [rhs as u64, (rhs >> 64) as u64, 0, 0],
+        },
+        &B127_FIELD,
+        clmul64_portable,
+    );
+    (result.limbs[0] as u128) | ((result.limbs[1] as u128) << 64)
+}
+
+fn reduce_b127_product(low: u128, high: u128) -> u128 {
+    let h = (low >> 127) | (high << 1);
+    (low & (u128::MAX >> 1)) ^ h ^ (h << 1)
 }
 
 fn reduce_product(low: u128, high: u128) -> u128 {
@@ -2273,11 +2769,60 @@ mod tests {
                 reduce_binary_product(product, &SECT193_FIELD)
             );
 
-            product[5] &= 0x1f;
+            product[5] &= (1u64 << 61) - 1;
             product[6] = 0;
+            assert_eq!(
+                reduce_b191_product(product),
+                reduce_binary_product(product, &B191_FIELD)
+            );
+
+            product[5] &= 0x1f;
             assert_eq!(
                 reduce_b163_product(product),
                 reduce_binary_product(product, &B163_FIELD)
+            );
+        }
+    }
+
+    #[test]
+    fn b191_multiplication_matches_reference() {
+        let mut rng = StdRng::seed_from_u64(0x1910_1910_1910_1910);
+        let mul = b191_backend().mul;
+        for _ in 0..10_000 {
+            let lhs = B163Element {
+                limbs: [rng.next_u64(), rng.next_u64(), rng.next_u64() >> 1],
+            };
+            let rhs = B163Element {
+                limbs: [rng.next_u64(), rng.next_u64(), rng.next_u64() >> 1],
+            };
+            assert_eq!(
+                mul(lhs, rhs).into_binary(),
+                mul_binary_reference(lhs.into_binary(), rhs.into_binary(), &B191_FIELD)
+            );
+        }
+    }
+
+    #[test]
+    fn b127_multiplication_matches_reference() {
+        let mut rng = StdRng::seed_from_u64(0x1270_1270_1270_1270);
+        let mul = b127_backend().mul;
+        for _ in 0..10_000 {
+            let lhs =
+                ((rng.next_u64() as u128) | ((rng.next_u64() as u128) << 64)) & (u128::MAX >> 1);
+            let rhs =
+                ((rng.next_u64() as u128) | ((rng.next_u64() as u128) << 64)) & (u128::MAX >> 1);
+            let expected = mul_binary_reference(
+                BinaryElement {
+                    limbs: [lhs as u64, (lhs >> 64) as u64, 0, 0],
+                },
+                BinaryElement {
+                    limbs: [rhs as u64, (rhs >> 64) as u64, 0, 0],
+                },
+                &B127_FIELD,
+            );
+            assert_eq!(
+                mul(lhs, rhs),
+                (expected.limbs[0] as u128) | ((expected.limbs[1] as u128) << 64)
             );
         }
     }
@@ -2328,6 +2873,24 @@ mod tests {
                 );
             }
         }
+
+        let backend = b191_backend();
+        for window_bits in [11, 15] {
+            let table = B163FixedBaseTable::new(window_bits, backend);
+            for exponent in [
+                BinaryElement::ZERO,
+                BinaryElement::ONE,
+                BinaryElement::U,
+                binary_from_limbs([0x1234_5678_90ab_cdef, 0xfedc_ba09_8765_4321, 0, 0]),
+                binary_from_limbs([u64::MAX, u64::MAX, 0, 0]),
+            ] {
+                assert_eq!(
+                    table.pow(exponent).into_binary(),
+                    pow_binary_reference(BinaryElement::U, exponent, &B191_FIELD),
+                    "compact field=b191, window_bits={window_bits}"
+                );
+            }
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -2349,6 +2912,13 @@ mod tests {
             assert_eq!(output, ghash_table.pow(exponent));
         }
 
+        let b127_table = FixedBaseTable::new(GhashElement::GENERATOR, 11, b127_backend());
+        let mut b127_outputs = [GhashElement::ZERO; 5];
+        compute_b127_random_powers_pmull_checked(&b127_table, &exponents_u128, &mut b127_outputs);
+        for (output, exponent) in b127_outputs.into_iter().zip(exponents_u128) {
+            assert_eq!(output, b127_table.pow(exponent));
+        }
+
         let ghash2_table =
             Ghash2FixedBaseTable::new(Ghash2Element::GENERATOR, 11, detected_backend());
         let mut ghash2_outputs = [Ghash2Element::ZERO; 5];
@@ -2366,6 +2936,13 @@ mod tests {
         compute_b163_random_powers_pmull_checked(&b163_table, &exponents_binary, &mut b163_outputs);
         for (output, exponent) in b163_outputs.into_iter().zip(exponents_binary) {
             assert_eq!(output, b163_table.pow(exponent));
+        }
+
+        let b191_table = B163FixedBaseTable::new(11, b191_backend());
+        let mut b191_outputs = [B163Element::ZERO; 5];
+        compute_b191_random_powers_pmull_checked(&b191_table, &exponents_binary, &mut b191_outputs);
+        for (output, exponent) in b191_outputs.into_iter().zip(exponents_binary) {
+            assert_eq!(output, b191_table.pow(exponent));
         }
 
         let sect193_backend = BinaryMulBackend::detect(&SECT193_FIELD);
