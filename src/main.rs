@@ -2,6 +2,9 @@ use rand::{RngCore, SeedableRng, rngs::StdRng};
 use std::env;
 
 mod generic;
+#[cfg(test)]
+mod iso_root;
+mod isomorphism;
 
 const DEFAULT_MIN_LOG: u32 = 16;
 const DEFAULT_MAX_LOG: u32 = 24;
@@ -24,6 +27,11 @@ const GHASH2_BITS: usize = 256;
 
 fn main() {
     let config = Config::parse_or_exit();
+
+    if config.isomorphism {
+        isomorphism::run(config);
+        return;
+    }
 
     if config.multiply {
         match config.field {
@@ -66,6 +74,7 @@ fn print_mul_header() {
 struct Config {
     field: FieldChoice,
     multiply: bool,
+    isomorphism: bool,
     min_log: u32,
     max_log: u32,
     samples: usize,
@@ -81,7 +90,7 @@ impl Config {
                 eprintln!("{message}");
                 eprintln!();
                 eprintln!(
-                    "usage: cargo run --release --bin ghash-powers-bench -- [--field b127|ghash128|ghash2|b163|b191|sect193|b256] [--mul] [--min-log N] [--max-log N] [--samples N] [--window-bits N] [--seed N]"
+                    "usage: cargo run --release --bin ghash-powers-bench -- [--field b127|ghash128|ghash2|b163|b191|sect193|b256] [--mul|--isomorphism] [--min-log N] [--max-log N] [--samples N] [--window-bits N] [--seed N]"
                 );
                 eprintln!(
                     "defaults: --field ghash128 --min-log 16 --max-log 24 --samples 1 --window-bits field-specific --seed 0x47484153485f2026"
@@ -95,6 +104,7 @@ impl Config {
         let mut config = Self {
             field: FieldChoice::Ghash128,
             multiply: false,
+            isomorphism: false,
             min_log: DEFAULT_MIN_LOG,
             max_log: DEFAULT_MAX_LOG,
             samples: DEFAULT_SAMPLES,
@@ -110,6 +120,7 @@ impl Config {
                     return Err(String::from("Binary-field benchmark"));
                 }
                 "--mul" => config.multiply = true,
+                "--isomorphism" | "--iso" => config.isomorphism = true,
                 "--field" => config.field = parse_field(&next_arg(&mut args, "--field")?)?,
                 "--min-log" => config.min_log = parse_next(&mut args, "--min-log")?,
                 "--max-log" => config.max_log = parse_next(&mut args, "--max-log")?,
@@ -161,6 +172,11 @@ impl Config {
         if !(1..=MAX_WINDOW_BITS).contains(&config.window_bits) {
             return Err(format!(
                 "--window-bits must be in 1..={MAX_WINDOW_BITS}; larger values make the fixed-base table very large"
+            ));
+        }
+        if config.multiply && config.isomorphism {
+            return Err(String::from(
+                "--mul and --isomorphism are mutually exclusive",
             ));
         }
 

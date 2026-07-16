@@ -160,6 +160,47 @@ Some notable results:
 Absolute timings can change with VM scheduling, thermal throttling, and CPU
 frequency. Compare fields using measurements from the same run.
 
+## b256 / ghash2 isomorphism
+
+The two 32-byte representations describe isomorphic copies of GF(2^256). The
+implemented map sends the b256 generator to a checked root of the b256 modulus
+inside `ghash2`. Powers of that root form a 256-by-256 binary forward matrix;
+binary Gaussian elimination constructs the inverse matrix.
+
+Runtime conversion uses a 52 KiB five-bit table per direction. Each input needs
+52 table lookups and XORs of 256-bit contributions. The input is treated as two
+128-bit streams; only the two field-boundary windows need special extraction.
+The emitted AArch64 loop uses pairs of NEON registers and four fixed independent
+accumulators. Bounds checks and general limb indexing are absent from the hot
+path; the independent accumulator chains overlap lookup latency. Matrix/table
+construction and input generation are outside the timed region.
+
+The table layout and loop shape were measured rather than assumed. The original
+four-bit loop took about 165 ns because of its lookup/extraction instruction
+count. A general five-bit loop reduced that to about 54 ns; specializing its
+window extraction and accumulator schedule reduced it again to about 23 ns.
+General six-bit and seven-bit tables took roughly 65 and 117 ns, while byte and
+bitsliced approaches took about 191 and 351 ns. A 16-element batched NEON `TBL`
+implementation took about 303 ns per element: partitioning the arbitrary map
+by output byte requires 128 table instructions per element, plus table loads,
+XORs, and input/output transposes. Only the winning specialized five-bit
+implementation is retained.
+
+At 2^22 elements and the best of 11 samples:
+
+| Operation | ns/element | Relative to b256 mul | Relative to ghash2 mul |
+|---|---:|---:|---:|
+| b256 -> ghash2 | 22.735 | 3.27x | 2.49x |
+| ghash2 -> b256 | 22.800 | 3.28x | 2.50x |
+| b256 multiplication | 6.950 | 1.00x | 0.76x |
+| ghash2 multiplication | 9.124 | 1.31x | 1.00x |
+
+A conversion in each direction costs about 45.5 ns. Since b256 saves about
+2.17 ns per multiplication versus ghash2, converting to b256, doing work, and
+converting back breaks even after roughly 21 multiplications. Conversion
+therefore belongs at representation boundaries, not around individual field
+operations.
+
 ## Running the benchmarks
 
 Build and run a fixed-base power benchmark:
@@ -182,6 +223,13 @@ cargo run --release -- --mul --field b191 \
   --min-log 20 --max-log 22 --samples 11
 ```
 
+Benchmark the b256/ghash2 isomorphism in both directions:
+
+```bash
+cargo run --release -- --isomorphism \
+  --min-log 20 --max-log 22 --samples 11
+```
+
 Supported field names are `b127`, `ghash128`, `ghash2`, `b163`, `b191`,
 `sect193`, and `b256`.
 
@@ -198,4 +246,7 @@ polynomial reference, exercise random full-width operands, check all seven
 generic field instantiations against portable arithmetic and reference table
 powering, verify the b256 modulus with Rabin's irreducibility criterion, and
 check the specialized PMULL kernels against independent reference
-implementations.
+implementations. Isomorphism tests check the chosen root, every basis vector,
+both matrix directions, random round trips, and compatibility with field
+multiplication. The ignored `iso_root` test reproducibly regenerates the
+canonical root constant when needed.
